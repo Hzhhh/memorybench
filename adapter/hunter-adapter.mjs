@@ -129,8 +129,10 @@ function makeAdapter() {
       const topK = opts?.topK ?? 10
       if (!turns.length) return { records: [] }
 
-      // 1) 查询分解（含原查询）
-      const queries = DECOMP ? await decompose(query) : [query]
+      // 1) 查询分类+分解（v5：LLM 输出 type + 子查询）
+      const dec = DECOMP ? await decompose(query) : { type: 'single', queries: [query] }
+      const queries = dec.queries
+      const qtype = dec.type
 
       // 2) 多查询 × 双通道 RRF 融合
       const qVecs = [] // {q, vec}
@@ -156,29 +158,53 @@ function makeAdapter() {
         rankAdd(denseTop(vec, CAND), w)
       }
 
-      // 2.5) 时序意图 → session 开场轮结构先验（GT 常聚在 t0：开场自述近况）
-      if (T0_BOOST > 0 && CHRONO_RE.test(query)) {
+      // 2.5) 结构先验：时序题(LLM分类，防 regex 误伤) → session 开场轮加权
+      if (T0_BOOST > 0 && (qtype === 'temporal' || (qtype === 'single' && CHRONO_RE.test(query)))) {
         for (const [idx, s] of fused) {
           if (turns[idx].turnIdx === 0) fused.set(idx, s * (1 + T0_BOOST))
         }
       }
 
-      const candidates = [...fused.entries()]
+      let candidates = [...fused.entries()]
         .sort((a, b) => b[1] - a[1])
         .slice(0, Math.max(POOL, topK))
         .map(([idx]) => idx)
       if (!candidates.length) return { records: [] }
 
-      // 3) 终排：LLM 证据选择 > 交叉重排 > 融合序（逐级降级）
+      // 2.6) 枚举计数题 → session 轮转配额（GT 散布 2-5 session，单查询必聚在 1-2 个；
+      //      每 session 最多占 2 席强制覆盖，实测 19/27 题 GT 恰跨 2-3 session）
+      if (qtype === 'enumeration') {
+        const perSession = new Map()
+        const seen = new Set()
+        const head = []
+        const tail = []
+        for (const idx of candidates) {
+          if (seen.has(idx)) continue
+          seen.add(idx)
+          const sid = turns[idx].sessionId
+          const used = perSession.get(sid) ?? 0
+          if (used < 2) {
+            head.push(idx)
+            perSession.set(sid, used + 1)
+          } else {
+            tail.push(idx)
+          }
+        }
+        candidates = [...head, ...tail]
+      }
+
+      // 3) 终排路由：枚举/更新题 → LLM 证据选择（+轮转序兜底）；其他题型 → 融合序
       let finalOrder = candidates
-      if (LLMSEL && candidates.length > 1) {
+      const wantSel = LLMSEL && (qtype === 'enumeration' || qtype === 'update')
+      if (wantSel && candidates.length > 1) {
         const selPool = candidates.slice(0, SEL_POOL)
         const sel = await llmSelect(query, selPool.map(i => turns[i]))
         if (sel && sel.length) {
-          const selSet = new Set(sel.map(i => candidates[i]))
-          finalOrder = [...sel.map(i => candidates[i]), ...candidates.filter(i => !selSet.has(i))]
+          const chosen = sel.map(i => candidates[i]).filter(i => i !== undefined)
+          const chosenSet = new Set(chosen)
+          finalOrder = [...chosen, ...candidates.filter(i => !chosenSet.has(i))]
         }
-      } else if (RERANK && candidates.length > 1) {
+      } else if (RERANK && qtype !== 'enumeration' && candidates.length > 1) {
         const rr = await rerank(query, candidates.map(i => turns[i].content))
         if (rr && rr.length) {
           const byIdx = new Map(rr.map(r => [r.index, r.score]))
