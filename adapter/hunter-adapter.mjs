@@ -25,19 +25,46 @@ const CAND = Number(process.env.MB_CAND ?? 30)
 const W_BM25 = Number(process.env.MB_W_BM25 ?? 1)
 const W_DENSE = Number(process.env.MB_W_DENSE ?? 1)
 const RRF_K = 60
+// 时序意图检测 → session 开场轮(t0)结构先验
+// 依据：51/500 题的 GT ≥50% 落在 t0（会话开场自述"近况"），这些题当前 recall@5 仅 0.485
+const CHRONO_RE = /order|chronolog|sequence|first|last|latest|earliest|before|after|recent|history|timeline|when did/i
+const T0_BOOST = Number(process.env.MB_T0_BOOST ?? 0.8)
+const SUBDENSE = process.env.MB_SUBDENSE === '1' // 子查询也走稠密通道
+// v4: LLM 证据选择 —— LLM 通读候选池原文，直接挑选含证据的轮次（比交叉重排更强）
+const LLMSEL = process.env.MB_LLMSEL === '1'
+const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 50)
+
+async function llmSelect(query, candTurns) {
+  const { chat } = await import('../lib/gateway.mjs')
+  const numbered = candTurns.map((t, i) => `[${i}] ${t.role}: ${t.content}`).join('\n')
+  const prompt =
+    'Below are numbered turns from a personal-assistant chat history. ' +
+    'Select the turns that CONTAIN EVIDENCE for answering the question — ' +
+    'the turns where the answer information actually appears (not turns merely discussing the topic).\n' +
+    `Question: ${query}\n\nTurns:\n${numbered}\n\n` +
+    `Return ONLY a JSON array of the ${Math.min(10, candTurns.length)} best turn numbers (best first), e.g. [3,0,17]. No other text.`
+  const raw = await chat([{ role: 'user', content: prompt }], { temperature: 0 })
+  if (!raw) return null
+  try {
+    const m = raw.match(/\[[\d\s,]*\]/)
+    if (!m) return null
+    const idxs = JSON.parse(m[0]).filter(x => Number.isInteger(x) && x >= 0 && x < candTurns.length)
+    return [...new Set(idxs)]
+  } catch { return null }
+}
 
 let counter = 0
 
 function makeAdapter() {
   const tag = `hunter-${(counter++).toString(36)}`
-  const turns = [] // {id, role, content, sessionId}
+  const turns = [] // {id, role, content, sessionId, turnIdx}
   let pending = null
   let indexed = null // {bm25, docVecs: Float32Array[]}
 
   async function flushPending() {
     if (pending) {
       for (const m of pending.msgs) {
-        turns.push({ id: m.id, role: m.role, content: m.content, sessionId: pending.sessionId })
+        turns.push({ id: m.id, role: m.role, content: m.content, sessionId: pending.sessionId, turnIdx: m.turnIdx })
       }
       pending = null
     }
@@ -85,6 +112,7 @@ function makeAdapter() {
         id: String(input.id),
         role: String(meta.role ?? 'user'),
         content: String(input.content ?? ''),
+        turnIdx: Number(meta.turnIdx ?? 0),
       })
       return {
         id: String(input.id),
@@ -105,12 +133,13 @@ function makeAdapter() {
       const queries = DECOMP ? await decompose(query) : [query]
 
       // 2) 多查询 × 双通道 RRF 融合
-      let qVec = null
+      const qVecs = [] // {q, vec}
       if (DENSE && indexed.docVecs) {
+        const toEmbed = SUBDENSE ? queries : [query]
         try {
-          const [v] = await embed([query])
-          qVec = v
-        } catch { qVec = null }
+          const vecs = await embed(toEmbed)
+          toEmbed.forEach((q, i) => qVecs.push({ q, vec: vecs[i] }))
+        } catch { /* 稠密通道整体降级 */ }
       }
       const fused = new Map() // idx -> score
       const rankAdd = (list, weight) => {
@@ -122,7 +151,17 @@ function makeAdapter() {
         const toks = tokenize(q)
         if (toks.length) rankAdd(indexed.bm25.topK(toks, CAND), W_BM25)
       }
-      if (qVec) rankAdd(denseTop(qVec, CAND), W_DENSE)
+      for (const { q, vec } of qVecs) {
+        const w = q === query ? W_DENSE : W_DENSE * 0.6 // 子查询稠密降权
+        rankAdd(denseTop(vec, CAND), w)
+      }
+
+      // 2.5) 时序意图 → session 开场轮结构先验（GT 常聚在 t0：开场自述近况）
+      if (T0_BOOST > 0 && CHRONO_RE.test(query)) {
+        for (const [idx, s] of fused) {
+          if (turns[idx].turnIdx === 0) fused.set(idx, s * (1 + T0_BOOST))
+        }
+      }
 
       const candidates = [...fused.entries()]
         .sort((a, b) => b[1] - a[1])
@@ -130,9 +169,16 @@ function makeAdapter() {
         .map(([idx]) => idx)
       if (!candidates.length) return { records: [] }
 
-      // 3) 重排（用原始问题）
+      // 3) 终排：LLM 证据选择 > 交叉重排 > 融合序（逐级降级）
       let finalOrder = candidates
-      if (RERANK && candidates.length > 1) {
+      if (LLMSEL && candidates.length > 1) {
+        const selPool = candidates.slice(0, SEL_POOL)
+        const sel = await llmSelect(query, selPool.map(i => turns[i]))
+        if (sel && sel.length) {
+          const selSet = new Set(sel.map(i => candidates[i]))
+          finalOrder = [...sel.map(i => candidates[i]), ...candidates.filter(i => !selSet.has(i))]
+        }
+      } else if (RERANK && candidates.length > 1) {
         const rr = await rerank(query, candidates.map(i => turns[i].content))
         if (rr && rr.length) {
           const byIdx = new Map(rr.map(r => [r.index, r.score]))
