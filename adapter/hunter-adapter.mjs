@@ -34,16 +34,62 @@ const T0_BOOST = Number(process.env.MB_T0_BOOST ?? 0.8)
 const SUBDENSE = process.env.MB_SUBDENSE === '1' // 子查询也走稠密通道
 // v4: LLM 证据选择 —— LLM 通读候选池原文，直接挑选含证据的轮次（比交叉重排更强）
 const LLMSEL = process.env.MB_LLMSEL === '1'
-const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 50)
+const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 25)
 // v6: 枚举题强化（二轮精炼+大池+配额3）+ 更新题最新值置顶（atlas update_detector 移植）
 const REFINE = process.env.MB_REFINE !== '0'
 const ENUM_CAND = Number(process.env.MB_ENUM_CAND ?? 50)
 const ENUM_POOL = Number(process.env.MB_ENUM_POOL ?? 100)
 const ENUM_QUOTA = Number(process.env.MB_ENUM_QUOTA ?? 3)
 const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
+// v7: top-10 LLM 重排序（靶点=157/500 题排序失败：相关轮在6-10位没进前5）
+const REORDER = process.env.MB_REORDER !== '0'
+// 角色先验：问"你/assistant 说过什么"→ assistant 轮加权
+const ASSISTANT_RE = /\b(you|your|assistant)\b[^.?]*\b(recommend|suggest|say|said|mention|mention|advise|propose|think)\b|\b(recommend|suggest|advise|propose)d?\b[^.?]*\b(you|assistant)\b/i
+const ROLE_BOOST = Number(process.env.MB_ROLE_BOOST ?? 0.3)
+
+async function llmReorder(query, candTurns) {
+  const numbered = candTurns
+    .map((t, i) => `[${i}] ${t.role}: ${centeredSnippet(t.content, query)}`)
+    .join('\n')
+  const prompt =
+    'Below are 10 numbered turns from a personal-assistant chat history, in a rough relevance order. ' +
+    'Reorder them so the turns that DIRECTLY CONTAIN the answer evidence come first — ' +
+    'the turns where the asked-for fact/value/event actually appears. ' +
+    'Turns that merely discuss the topic go last.\n' +
+    `Question: ${query}\n\nTurns:\n${numbered}\n\n` +
+    'Return ONLY a JSON array of ALL 10 turn numbers in your chosen order (best first), e.g. [4,0,7,1,2,3,5,6,8,9]. No other text.'
+  const raw = await chat([{ role: 'user', content: prompt }], { temperature: 0 })
+  if (!raw) return null
+  try {
+    const m = raw.match(/\[[\d\s,]*\]/)
+    if (!m) return null
+    const idxs = JSON.parse(m[0]).filter(x => Number.isInteger(x) && x >= 0 && x < candTurns.length)
+    return [...new Set(idxs)]
+  } catch { return null }
+}
+
+// 居中截断片段（移植 atlas agent_search._centered_snippet：证据常在偏移 400-3300，
+// 头窗截断会全盲；=头 120 + 查询词命中处开窗）
+function centeredSnippet(content, query, total = 280) {
+  if (content.length <= total) return content
+  const low = content.toLowerCase()
+  let best = -1
+  for (const t of new Set((query.toLowerCase().match(/[a-z0-9]{4,}/g) ?? []))) {
+    const p = low.indexOf(t)
+    if (p !== -1 && (best === -1 || p < best)) best = p
+  }
+  if (best < 0 || best < total - 160) return content.slice(0, total) + ` …[+${content.length - total}]`
+  const head = content.slice(0, 120)
+  const winStart = Math.max(0, best - 80)
+  const window = content.slice(winStart, winStart + total - 130)
+  const rest = content.length - (winStart + total - 130)
+  return `${head} …[…] ${window}` + (rest > 0 ? ` …[+${rest}]` : '')
+}
 
 async function llmSelect(query, candTurns, mode) {
-  const numbered = candTurns.map((t, i) => `[${i}] ${t.role}: ${t.content}`).join('\n')
+  const numbered = candTurns
+    .map((t, i) => `[${i}] ${t.role}: ${centeredSnippet(t.content, query)}`)
+    .join('\n')
   const task = mode === 'enumeration'
     ? 'The question asks to count/list items of a category. Select ALL turns that each mention a DISTINCT instance of that category — one turn per instance, the most explicit mentions first. Do not select turns that merely discuss the topic without stating an instance.'
     : 'Select the turns that CONTAIN EVIDENCE for answering the question — the turns where the answer information actually appears (not turns merely discussing the topic).'
@@ -175,6 +221,13 @@ function makeAdapter() {
         }
       }
 
+      // 2.52) 角色先验：问"你(assistant)建议/推荐过什么" → assistant 轮加权
+      if (ROLE_BOOST > 0 && ASSISTANT_RE.test(query)) {
+        for (const [idx, s] of fused) {
+          if (turns[idx].role === 'assistant') fused.set(idx, s * (1 + ROLE_BOOST))
+        }
+      }
+
       // 2.55) 枚举题二轮精炼：看已命中片段 → 补同义词/未覆盖实例查询 → 再融合
       if (qtype === 'enumeration' && REFINE) {
         const top15 = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([i]) => i)
@@ -265,6 +318,18 @@ function makeAdapter() {
         const li = findLatestUpdateTurn(query, turns)
         if (li !== null) {
           finalOrder = [li, ...finalOrder.filter(i => i !== li)]
+        }
+      }
+
+      // 3.6) v7: 非选证路径（single/temporal）的 top-10 LLM 重排序
+      //      靶点：157/500 题"相关轮在 6-10 位没进前 5"的排序失败
+      if (REORDER && !wantSel && finalOrder.length > 1) {
+        const head = finalOrder.slice(0, topK)
+        const perm = await llmReorder(query, head.map(i => turns[i]))
+        if (perm && perm.length >= Math.min(5, head.length)) {
+          const inPerm = new Set(perm)
+          const missed = head.map((_, i) => i).filter(i => !inPerm.has(i))
+          finalOrder = [...perm.map(i => head[i]), ...missed.map(i => head[i]), ...finalOrder.slice(topK)]
         }
       }
 
