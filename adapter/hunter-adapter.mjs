@@ -15,7 +15,9 @@
 import { UnsupportedError } from '@mtlopenyc/contract'
 import { BM25, tokenize } from '../lib/bm25.mjs'
 import { embed, rerank } from '../lib/gateway.mjs'
+import { chat } from '../lib/gateway.mjs'
 import { decompose } from '../lib/query.mjs'
+import { findLatestUpdateTurn } from '../lib/update.mjs'
 
 const DECOMP = process.env.MB_DECOMP !== '0'
 const DENSE = process.env.MB_DENSE !== '0'
@@ -33,14 +35,21 @@ const SUBDENSE = process.env.MB_SUBDENSE === '1' // 子查询也走稠密通道
 // v4: LLM 证据选择 —— LLM 通读候选池原文，直接挑选含证据的轮次（比交叉重排更强）
 const LLMSEL = process.env.MB_LLMSEL === '1'
 const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 50)
+// v6: 枚举题强化（二轮精炼+大池+配额3）+ 更新题最新值置顶（atlas update_detector 移植）
+const REFINE = process.env.MB_REFINE !== '0'
+const ENUM_CAND = Number(process.env.MB_ENUM_CAND ?? 50)
+const ENUM_POOL = Number(process.env.MB_ENUM_POOL ?? 100)
+const ENUM_QUOTA = Number(process.env.MB_ENUM_QUOTA ?? 3)
+const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
 
-async function llmSelect(query, candTurns) {
-  const { chat } = await import('../lib/gateway.mjs')
+async function llmSelect(query, candTurns, mode) {
   const numbered = candTurns.map((t, i) => `[${i}] ${t.role}: ${t.content}`).join('\n')
+  const task = mode === 'enumeration'
+    ? 'The question asks to count/list items of a category. Select ALL turns that each mention a DISTINCT instance of that category — one turn per instance, the most explicit mentions first. Do not select turns that merely discuss the topic without stating an instance.'
+    : 'Select the turns that CONTAIN EVIDENCE for answering the question — the turns where the answer information actually appears (not turns merely discussing the topic).'
   const prompt =
     'Below are numbered turns from a personal-assistant chat history. ' +
-    'Select the turns that CONTAIN EVIDENCE for answering the question — ' +
-    'the turns where the answer information actually appears (not turns merely discussing the topic).\n' +
+    task + '\n' +
     `Question: ${query}\n\nTurns:\n${numbered}\n\n` +
     `Return ONLY a JSON array of the ${Math.min(10, candTurns.length)} best turn numbers (best first), e.g. [3,0,17]. No other text.`
   const raw = await chat([{ role: 'user', content: prompt }], { temperature: 0 })
@@ -134,7 +143,8 @@ function makeAdapter() {
       const queries = dec.queries
       const qtype = dec.type
 
-      // 2) 多查询 × 双通道 RRF 融合
+      // 2) 多查询 × 双通道 RRF 融合（枚举题用更大 CAND）
+      const candN = qtype === 'enumeration' ? Math.max(CAND, ENUM_CAND) : CAND
       const qVecs = [] // {q, vec}
       if (DENSE && indexed.docVecs) {
         const toEmbed = SUBDENSE ? queries : [query]
@@ -151,28 +161,62 @@ function makeAdapter() {
       }
       for (const q of queries) {
         const toks = tokenize(q)
-        if (toks.length) rankAdd(indexed.bm25.topK(toks, CAND), W_BM25)
+        if (toks.length) rankAdd(indexed.bm25.topK(toks, candN), W_BM25)
       }
       for (const { q, vec } of qVecs) {
         const w = q === query ? W_DENSE : W_DENSE * 0.6 // 子查询稠密降权
-        rankAdd(denseTop(vec, CAND), w)
+        rankAdd(denseTop(vec, candN), w)
       }
 
-      // 2.5) 结构先验：时序题(LLM分类，防 regex 误伤) → session 开场轮加权
-      if (T0_BOOST > 0 && (qtype === 'temporal' || (qtype === 'single' && CHRONO_RE.test(query)))) {
+      // 2.5) 结构先验：时序题 → session 开场轮加权（regex OR LLM 分类双触发）
+      if (T0_BOOST > 0 && (qtype === 'temporal' || CHRONO_RE.test(query))) {
         for (const [idx, s] of fused) {
           if (turns[idx].turnIdx === 0) fused.set(idx, s * (1 + T0_BOOST))
         }
       }
 
+      // 2.55) 枚举题二轮精炼：看已命中片段 → 补同义词/未覆盖实例查询 → 再融合
+      if (qtype === 'enumeration' && REFINE) {
+        const top15 = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([i]) => i)
+        const seenTxt = top15.map((i, n) => `[${n}] ${turns[i].content.slice(0, 160)}`).join('\n')
+        const raw = await chat([{
+          role: 'user',
+          content:
+            'Question: ' + query + '\n\nCandidate evidence turns found so far:\n' + seenTxt +
+            '\n\nThe question asks to count/list items of a category. Instances may use vocabulary not yet covered. ' +
+            'Write 1-3 NEW search queries targeting instance types/synonyms NOT yet represented above. ' +
+            'Return ONLY a JSON array of strings.',
+        }], { temperature: 0 })
+        if (raw) {
+          try {
+            const m = raw.match(/\[[\s\S]*\]/)
+            if (m) {
+              const extra = JSON.parse(m[0]).filter(x => typeof x === 'string' && x.trim()).map(x => x.trim()).slice(0, 3)
+              if (extra.length) {
+                for (const q of extra) {
+                  const toks = tokenize(q)
+                  if (toks.length) rankAdd(indexed.bm25.topK(toks, ENUM_CAND), W_BM25)
+                }
+                if (DENSE && indexed.docVecs) {
+                  try {
+                    const ev = await embed(extra)
+                    ev.forEach((vec, i2) => rankAdd(denseTop(vec, ENUM_CAND), W_DENSE * 0.6))
+                  } catch { /* 精炼稠密失败降级 */ }
+                }
+              }
+            }
+          } catch { /* 解析失败用原融合 */ }
+        }
+      }
+
+      const poolSize = qtype === 'enumeration' ? Math.max(POOL, ENUM_POOL) : Math.max(POOL, topK)
       let candidates = [...fused.entries()]
         .sort((a, b) => b[1] - a[1])
-        .slice(0, Math.max(POOL, topK))
+        .slice(0, poolSize)
         .map(([idx]) => idx)
       if (!candidates.length) return { records: [] }
 
-      // 2.6) 枚举计数题 → session 轮转配额（GT 散布 2-5 session，单查询必聚在 1-2 个；
-      //      每 session 最多占 2 席强制覆盖，实测 19/27 题 GT 恰跨 2-3 session）
+      // 2.6) 枚举计数题 → session 轮转配额（GT 散布 2-5 session，每 session ≤ENUM_QUOTA 席）
       if (qtype === 'enumeration') {
         const perSession = new Map()
         const seen = new Set()
@@ -183,7 +227,7 @@ function makeAdapter() {
           seen.add(idx)
           const sid = turns[idx].sessionId
           const used = perSession.get(sid) ?? 0
-          if (used < 2) {
+          if (used < ENUM_QUOTA) {
             head.push(idx)
             perSession.set(sid, used + 1)
           } else {
@@ -193,12 +237,12 @@ function makeAdapter() {
         candidates = [...head, ...tail]
       }
 
-      // 3) 终排路由：枚举/更新题 → LLM 证据选择（+轮转序兜底）；其他题型 → 融合序
+      // 3) 终排路由：枚举/更新题 → LLM 证据选择（枚举专用提示词）；其他题型 → 融合序
       let finalOrder = candidates
       const wantSel = LLMSEL && (qtype === 'enumeration' || qtype === 'update')
       if (wantSel && candidates.length > 1) {
         const selPool = candidates.slice(0, SEL_POOL)
-        const sel = await llmSelect(query, selPool.map(i => turns[i]))
+        const sel = await llmSelect(query, selPool.map(i => turns[i]), qtype)
         if (sel && sel.length) {
           const chosen = sel.map(i => candidates[i]).filter(i => i !== undefined)
           const chosenSet = new Set(chosen)
@@ -212,6 +256,15 @@ function makeAdapter() {
             .map((idx, i) => [idx, byIdx.get(i) ?? -1e9])
             .sort((a, b) => b[1] - a[1])
             .map(x => x[0])
+        }
+      }
+
+      // 3.5) 更新题：最新值轮置顶（atlas update_detector 规则移植：
+      //      marker 词 + 值 + 与问题主题词干重叠 ≥2，取时间序最后命中）
+      if (qtype === 'update' && UPDATE_BOOST) {
+        const li = findLatestUpdateTurn(query, turns)
+        if (li !== null) {
+          finalOrder = [li, ...finalOrder.filter(i => i !== li)]
         }
       }
 
