@@ -4,7 +4,13 @@
 //   BM25 k1=8 b=1.1（超长文档惩罚:短证据语句优待） + t0先验 + 枚举配额 + update置顶
 //   + HyDE（LLM生成假设证据原话作额外查询） + ATA（LLM先答题再标注支撑轮）
 //   + 求建议句式跳过ATA（preference题融合序已最优）
-import { UnsupportedError } from '@mtlopenyc/contract'
+// UnsupportedError 与 @mtlopenyc/contract 同形（harness 按 name 识别）——内置以支持独立部署
+class UnsupportedError extends Error {
+  constructor(capability, message) {
+    super(message ?? `capability not supported: ${capability}`)
+    this.name = 'UnsupportedError'
+  }
+}
 import { readFileSync, existsSync } from 'node:fs'
 import { BM25, tokenize } from '../lib/bm25.mjs'
 import { embed, rerank, chat } from '../lib/gateway.mjs'
@@ -180,12 +186,18 @@ function makeAdapter() {
       if (!turns.length) return { records: [] }
 
       // 1) 分类+分解 + HyDE（缓存优先，miss 走 live）
-      const dec = DECOMP
-        ? (USE_CACHE && CACHES?.decompose?.[cacheKey]) ?? await decompose(query)
-        : { type: 'single', queries: [query] }
-      const hydeTexts = HYDE
-        ? (USE_CACHE && CACHES?.hyde?.[cacheKey]) ?? await hydeGen(query)
-        : []
+      let dec
+      if (DECOMP) {
+        const cachedDec = USE_CACHE && CACHES ? CACHES.decompose?.[cacheKey] : undefined
+        dec = cachedDec ?? await decompose(query)
+      } else {
+        dec = { type: 'single', queries: [query] }
+      }
+      let hydeTexts = []
+      if (HYDE) {
+        const cachedHyde = USE_CACHE && CACHES ? CACHES.hyde?.[cacheKey] : undefined
+        hydeTexts = cachedHyde ?? await hydeGen(query)
+      }
       const queries = HYDE ? [...dec.queries, ...hydeTexts] : dec.queries
       const qtype = dec.type
 
