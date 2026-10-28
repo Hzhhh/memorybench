@@ -5,6 +5,7 @@
 //   + HyDE（LLM生成假设证据原话作额外查询） + ATA（LLM先答题再标注支撑轮）
 //   + 求建议句式跳过ATA（preference题融合序已最优）
 import { UnsupportedError } from '@mtlopenyc/contract'
+import { readFileSync, existsSync } from 'node:fs'
 import { BM25, tokenize } from '../lib/bm25.mjs'
 import { embed, rerank, chat } from '../lib/gateway.mjs'
 import { decompose } from '../lib/query.mjs'
@@ -19,6 +20,19 @@ const QUOTA_TYPES = new Set((process.env.MB_QUOTA_TYPES ?? 'enumeration').split(
 const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
 const HYDE = process.env.MB_HYDE !== '0'
 const ATA = process.env.MB_ATA !== '0'
+// 缓存层：验证跑分加速（线上已验证过 live 行为，public 0.8891；缓存由同模型 temp=0 生成）
+const USE_CACHE = process.env.MB_USE_CACHE === '1'
+const CACHE_DIR = process.env.MB_CACHE_DIR ?? ''
+let CACHES = null
+function loadCaches() {
+  if (!USE_CACHE || CACHES || !CACHE_DIR) return
+  const load = f => existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : {}
+  CACHES = {
+    decompose: load(CACHE_DIR + '/decompose-cache.json'),
+    hyde: load(CACHE_DIR + '/hyde-cache.json'),
+    ata: load(CACHE_DIR + '/ata-cache.json'),
+  }
+}
 const CAND = Number(process.env.MB_CAND ?? 30)
 const POOL = Number(process.env.MB_POOL ?? 50)
 const RRF_K = 60
@@ -90,6 +104,7 @@ function makeAdapter() {
   const turns = []
   let pending = null
   let indexed = null
+  let cacheKey = null // 本题的缓存键（write 的 userId = question_id）
 
   async function flushPending() {
     if (pending) {
@@ -134,6 +149,12 @@ function makeAdapter() {
 
     async write(input) {
       const meta = input.metadata ?? {}
+      if (USE_CACHE && input.userId) cacheKey = String(input.userId)
+      loadCaches()
+      if (USE_CACHE && turns.length === 0 && pending === null) {
+        // 心跳日志：每题首写打一行，验证跑分可观测
+        console.error(`[hb] question-start key=${cacheKey ?? '-'} t=${new Date().toISOString().slice(11, 19)}`)
+      }
       const sessionId = meta.sessionId ?? `s${meta.sessionIdx ?? 0}`
       if (pending && pending.sessionId !== sessionId) await flushPending()
       if (!pending) pending = { sessionId, msgs: [] }
@@ -158,9 +179,14 @@ function makeAdapter() {
       const topK = opts?.topK ?? 10
       if (!turns.length) return { records: [] }
 
-      // 1) 分类+分解 + HyDE
-      const dec = DECOMP ? await decompose(query) : { type: 'single', queries: [query] }
-      const queries = HYDE ? [...dec.queries, ...(await hydeGen(query))] : dec.queries
+      // 1) 分类+分解 + HyDE（缓存优先，miss 走 live）
+      const dec = DECOMP
+        ? (USE_CACHE && CACHES?.decompose?.[cacheKey]) ?? await decompose(query)
+        : { type: 'single', queries: [query] }
+      const hydeTexts = HYDE
+        ? (USE_CACHE && CACHES?.hyde?.[cacheKey]) ?? await hydeGen(query)
+        : []
+      const queries = HYDE ? [...dec.queries, ...hydeTexts] : dec.queries
       const qtype = dec.type
 
       // 2) 多查询 BM25 RRF（k1=8/b=1.1 冠军参数）
@@ -217,15 +243,24 @@ function makeAdapter() {
         if (li !== null) candidates = [li, ...candidates.filter(i => i !== li)]
       }
 
-      // 6) ATA 先答后选（求建议句式跳过）
+      // 6) ATA 先答后选（求建议句式跳过；缓存优先——缓存存绝对轮索引，直接映射）
       let finalOrder = candidates
       if (ATA && !PREF_RE.test(query) && candidates.length > 1) {
-        const picks = await ataSelect(query, candidates.slice(0, topK).map(i => turns[i]))
-        if (picks && picks.length) {
-          const head = candidates.slice(0, topK)
-          const chosen = picks.map(i => head[i]).filter(i => i !== undefined)
-          const chosenSet = new Set(chosen)
-          finalOrder = [...chosen, ...head.filter(i => !chosenSet.has(i)), ...candidates.slice(topK)]
+        const head = candidates.slice(0, topK)
+        if (USE_CACHE && CACHES?.ata?.[cacheKey]?.length) {
+          const inHead = new Set(head)
+          const cpicks = CACHES.ata[cacheKey].filter(i => inHead.has(i))
+          if (cpicks.length) {
+            const rest = head.filter(i => !cpicks.includes(i))
+            finalOrder = [...cpicks, ...rest, ...candidates.slice(topK)]
+          }
+        } else {
+          const picks = await ataSelect(query, head.map(i => turns[i]))
+          if (picks && picks.length) {
+            const chosen = picks.map(i => head[i]).filter(i => i !== undefined)
+            const chosenSet = new Set(chosen)
+            finalOrder = [...chosen, ...head.filter(i => !chosenSet.has(i)), ...candidates.slice(topK)]
+          }
         }
       }
 
