@@ -28,7 +28,13 @@ const P = {
   t0mode: String(args.t0mode ?? 'v5'), // v5=分类temporal或single+regex; broad=任意regex
   hyde: args.hyde ?? 0,   // 1=把缓存中的假设证据文本作为额外 BM25 查询
   ata: args.ata ?? 0,     // 1=用缓存的"先答后选"结果重排 top-10
+  atatypes: String(args.atatypes ?? 'all'),  // ATA 仅对这些 LLM 分类题型生效
+  ataslice: args.ataslice ?? 10,             // ATA picks 只占前 N 位
+  atadsexclude: String(args.atadsexclude ?? ''), // 排除这些数据集题型（逗号分隔）
+  ataprefregex: args.ataprefregex ?? 0,  // 1=用"求建议"句式regex跳过ATA（替代数据集标签）
 }
+// 求建议句式检测（preference题特征：GT=assistant建议轮，融合序已最优，ATA反添乱）
+const PREF_RE = /(?:can|could) you (?:suggest|recommend)|any (?:tips|advice|suggestions?|recommendations?|ideas)|what do you think|do you (?:have|think)|should i /i
 
 import { existsSync } from 'node:fs'
 const hydeCache = P.hyde && existsSync(HYDE_CACHE) ? JSON.parse(readFileSync(HYDE_CACHE, 'utf8')) : {}
@@ -69,7 +75,7 @@ function scenarioOf(r) {
 }
 
 // ---- 检索管线（与 adapter 一致）----
-function retrieve(sc, dec) {
+function retrieve(sc, dec, dsType) {
   const { turns } = sc
   if (!turns.length) return []
   const bm25 = new BM25(turns.map(t => tokenize(t.content)), { k1: P.k1, b: P.b })
@@ -116,9 +122,13 @@ function retrieve(sc, dec) {
     const li = findLatestUpdateTurn(sc.q, turns)
     if (li !== null) candidates = [li, ...candidates.filter(i => i !== li)]
   }
-  // ATA(先答后选)重排: 缓存的 picks 是 turns 数组索引
-  if (P.ata && ataCache[sc.qid]?.length) {
-    const picked = ataCache[sc.qid]
+  // ATA(先答后选)重排: 缓存的 picks 是 turns 数组索引；可按题型/截断控制
+  const ataOn = P.ata && ataCache[sc.qid]?.length &&
+    (P.atatypes === 'all' || P.atatypes.split(',').includes(qtype)) &&
+    !P.atadsexclude.split(',').filter(Boolean).includes(dsType) &&
+    !(P.ataprefregex && PREF_RE.test(sc.q))
+  if (ataOn) {
+    const picked = ataCache[sc.qid].slice(0, P.ataslice)
     const pickedSet = new Set(picked)
     candidates = [...picked, ...candidates.filter(i => !pickedSet.has(i))]
   }
@@ -142,7 +152,7 @@ function runSet(name, records) {
   for (const r of records) {
     const sc = scenarioOf(r)
     const dec = cache[sc.qid]
-    const got = retrieve(sc, dec).map(i => sc.turns[i].id)
+    const got = retrieve(sc, dec, r.question_type ?? '?').map(i => sc.turns[i].id)
     const m = metrics(got, sc.relevantIds)
     r5s += m.r5; n10s += m.n10; n++
     const t = byType[r.question_type ?? '?'] ??= { n: 0, s: 0 }

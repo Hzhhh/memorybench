@@ -1,60 +1,85 @@
-// hunter-adapter.mjs — MemoryBench 冲榜专用适配器（进程内全流程）
+// hunter-adapter.mjs — MemoryBench 冲榜 v10：HyDE + ATA(先答后选) + 高惩罚BM25
 // ====================================================================
-// 流水线：LLM 查询分解 → 多查询 [BM25 + 网关稠密] RRF 融合 → 网关 rerank → top-10
-// 设计：
-//   - 工厂导出：isolate=true 每题全新状态（题间天然隔离）
-//   - write 仅缓冲；首个 retrieve 时一次性建 BM25 索引 + 批量向量（并行）
-//   - 全链路降级：LLM 失败→单查询；embedding 失败→纯 BM25；rerank 失败→融合序
-// 环境开关：
-//   MB_DECOMP=1    LLM 查询分解（默认开）
-//   MB_DENSE=1     稠密通道（默认开）
-//   MB_RERANK=1    重排（默认开）
-//   MB_POOL=50     重排候选池大小
-//   MB_CAND=30     每查询每通道取前 N
-//   MB_W_BM25 / MB_W_DENSE   RRF 权重（默认 1/1）
+// 离线扫参冠军配置（500题 0.8835, holdout 0.8875）:
+//   BM25 k1=8 b=1.1（超长文档惩罚:短证据语句优待） + t0先验 + 枚举配额 + update置顶
+//   + HyDE（LLM生成假设证据原话作额外查询） + ATA（LLM先答题再标注支撑轮）
+//   + 求建议句式跳过ATA（preference题融合序已最优）
 import { UnsupportedError } from '@mtlopenyc/contract'
 import { BM25, tokenize } from '../lib/bm25.mjs'
-import { embed, rerank } from '../lib/gateway.mjs'
+import { embed, rerank, chat } from '../lib/gateway.mjs'
 import { decompose } from '../lib/query.mjs'
 import { findLatestUpdateTurn } from '../lib/update.mjs'
 
 const DECOMP = process.env.MB_DECOMP !== '0'
-const DENSE = process.env.MB_DENSE !== '0'
-const RERANK = process.env.MB_RERANK !== '0'
-const POOL = Number(process.env.MB_POOL ?? 50)
-const CAND = Number(process.env.MB_CAND ?? 30)
-const W_BM25 = Number(process.env.MB_W_BM25 ?? 1)
-const W_DENSE = Number(process.env.MB_W_DENSE ?? 1)
-const RRF_K = 60
-// 时序意图检测 → session 开场轮(t0)结构先验
-// 依据：51/500 题的 GT ≥50% 落在 t0（会话开场自述"近况"），这些题当前 recall@5 仅 0.485
-const CHRONO_RE = /order|chronolog|sequence|first|last|latest|earliest|before|after|recent|history|timeline|when did/i
-const T0_BOOST = Number(process.env.MB_T0_BOOST ?? 0.8)
-const SUBDENSE = process.env.MB_SUBDENSE === '1' // 子查询也走稠密通道
-// v4: LLM 证据选择 —— LLM 通读候选池原文，直接挑选含证据的轮次（比交叉重排更强）
-const LLMSEL = process.env.MB_LLMSEL === '1'
-const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 50)
-// v8: 更新题最新值置顶（atlas update_detector 规则移植，单变量叠加实验）
-const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
-// v9: session 配额适用题型扩展（默认仅枚举；多证据题 temporal/update 的卡位轮 53/61 跨 session）
+const DENSE = process.env.MB_DENSE === '1' // v10 默认关（离线实证负贡献）
+const K1 = Number(process.env.MB_K1 ?? 8)
+const B = Number(process.env.MB_B ?? 1.1)
+const T0_BOOST = Number(process.env.MB_T0_BOOST ?? 1.0)
 const QUOTA_TYPES = new Set((process.env.MB_QUOTA_TYPES ?? 'enumeration').split(',').map(s => s.trim()).filter(Boolean))
+const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
+const HYDE = process.env.MB_HYDE !== '0'
+const ATA = process.env.MB_ATA !== '0'
+const CAND = Number(process.env.MB_CAND ?? 30)
+const POOL = Number(process.env.MB_POOL ?? 50)
+const RRF_K = 60
 
-async function llmSelect(query, candTurns) {
-  const { chat } = await import('../lib/gateway.mjs')
-  const numbered = candTurns.map((t, i) => `[${i}] ${t.role}: ${t.content}`).join('\n')
-  const prompt =
-    'Below are numbered turns from a personal-assistant chat history. ' +
-    'Select the turns that CONTAIN EVIDENCE for answering the question — ' +
-    'the turns where the answer information actually appears (not turns merely discussing the topic).\n' +
-    `Question: ${query}\n\nTurns:\n${numbered}\n\n` +
-    `Return ONLY a JSON array of the ${Math.min(10, candTurns.length)} best turn numbers (best first), e.g. [3,0,17]. No other text.`
-  const raw = await chat([{ role: 'user', content: prompt }], { temperature: 0 })
+const CHRONO_RE = /order|chronolog|sequence|first|last|latest|earliest|before|after|recent|history|timeline|when did/i
+// 求建议句式（preference 题特征）：GT=assistant建议轮，融合序已最优，ATA反添乱
+const PREF_RE = /(?:can|could) you (?:suggest|recommend)|any (?:tips|advice|suggestions?|recommendations?|ideas)|what do you think|do you (?:have|think)|should i /i
+
+function centeredSnippet(content, query, total = 280) {
+  if (content.length <= total) return content
+  const low = content.toLowerCase()
+  let best = -1
+  for (const t of new Set((query.toLowerCase().match(/[a-z0-9]{4,}/g) ?? []))) {
+    const p = low.indexOf(t)
+    if (p !== -1 && (best === -1 || p < best)) best = p
+  }
+  if (best < 0 || best < total - 160) return content.slice(0, total) + ` …[+${content.length - total}]`
+  const head = content.slice(0, 120)
+  const winStart = Math.max(0, best - 80)
+  const window = content.slice(winStart, winStart + total - 130)
+  const rest = content.length - (winStart + total - 130)
+  return `${head} …[…] ${window}` + (rest > 0 ? ` …[+${rest}]` : '')
+}
+
+/** HyDE：生成假设证据原话（作为额外 BM25 查询） */
+async function hydeGen(query) {
+  const raw = await chat([{
+    role: 'user',
+    content:
+      'A question will be asked about a personal-assistant chat history. ' +
+      'Write 3 short FIRST-PERSON utterances (as if the user said them in past chats) that would CONTAIN the answer evidence. ' +
+      'Use the concrete entities/names/values the answer would mention, conversational tone, each under 20 words.\n' +
+      'Return ONLY a JSON array of 3 strings.\n\nQuestion: ' + query,
+  }])
+  if (!raw) return []
+  try {
+    const m = raw.match(/\[[\s\S]*\]/)
+    if (m) return JSON.parse(m[0]).filter(x => typeof x === 'string' && x.trim()).slice(0, 3)
+  } catch { /* 空降级 */ }
+  return []
+}
+
+/** ATA（先答后选）：LLM 先答题，再标注支撑轮（比裸判证据强得多，+0.096 实证） */
+async function ataSelect(query, topTurns) {
+  const numbered = topTurns
+    .map((t, i) => `[${i}] ${t.role}: ${centeredSnippet(t.content, query)}`)
+    .join('\n')
+  const raw = await chat([{
+    role: 'user',
+    content:
+      'Answer the question using ONLY the numbered chat turns below. Then list which turns contain the evidence for your answer.\n' +
+      `Question: ${query}\n\nTurns:\n${numbered}\n\n` +
+      'Return ONLY JSON: {"answer":"...","evidence":[turn numbers best first]} no other text.',
+  }])
   if (!raw) return null
   try {
-    const m = raw.match(/\[[\d\s,]*\]/)
+    const m = raw.match(/\{[\s\S]*\}/)
     if (!m) return null
-    const idxs = JSON.parse(m[0]).filter(x => Number.isInteger(x) && x >= 0 && x < candTurns.length)
-    return [...new Set(idxs)]
+    const o = JSON.parse(m[0])
+    if (!Array.isArray(o.evidence)) return null
+    return [...new Set(o.evidence.filter(x => Number.isInteger(x) && x >= 0 && x < topTurns.length))]
   } catch { return null }
 }
 
@@ -62,9 +87,9 @@ let counter = 0
 
 function makeAdapter() {
   const tag = `hunter-${(counter++).toString(36)}`
-  const turns = [] // {id, role, content, sessionId, turnIdx}
+  const turns = []
   let pending = null
-  let indexed = null // {bm25, docVecs: Float32Array[]}
+  let indexed = null
 
   async function flushPending() {
     if (pending) {
@@ -77,7 +102,7 @@ function makeAdapter() {
 
   async function ensureIndex() {
     if (indexed || !turns.length) return
-    const bm25 = new BM25(turns.map(t => tokenize(t.content)))
+    const bm25 = new BM25(turns.map(t => tokenize(t.content)), { k1: K1, b: B })
     let docVecs = null
     if (DENSE) {
       try {
@@ -85,7 +110,6 @@ function makeAdapter() {
         if (docVecs.length !== turns.length) docVecs = null
       } catch (e) {
         console.error(`[${tag}] embed failed:`, e.message)
-        docVecs = null
       }
     }
     indexed = { bm25, docVecs }
@@ -105,8 +129,8 @@ function makeAdapter() {
   }
 
   return {
-    id: 'hunter',
-    description: 'MemoryBench 冲榜系统：LLM查询分解 + BM25/稠密多查询RRF + 交叉重排',
+    id: 'hunter-v10',
+    description: 'MemoryBench 冲榜: HyDE+ATA先答后选+高惩罚BM25(k1=8,b=1.1)+t0先验+枚举配额+update置顶',
 
     async write(input) {
       const meta = input.metadata ?? {}
@@ -134,21 +158,20 @@ function makeAdapter() {
       const topK = opts?.topK ?? 10
       if (!turns.length) return { records: [] }
 
-      // 1) 查询分类+分解（v5：LLM 输出 type + 子查询）
+      // 1) 分类+分解 + HyDE
       const dec = DECOMP ? await decompose(query) : { type: 'single', queries: [query] }
-      const queries = dec.queries
+      const queries = HYDE ? [...dec.queries, ...(await hydeGen(query))] : dec.queries
       const qtype = dec.type
 
-      // 2) 多查询 × 双通道 RRF 融合
-      const qVecs = [] // {q, vec}
+      // 2) 多查询 BM25 RRF（k1=8/b=1.1 冠军参数）
+      const qVecs = []
       if (DENSE && indexed.docVecs) {
-        const toEmbed = SUBDENSE ? queries : [query]
         try {
-          const vecs = await embed(toEmbed)
-          toEmbed.forEach((q, i) => qVecs.push({ q, vec: vecs[i] }))
-        } catch { /* 稠密通道整体降级 */ }
+          const vecs = await embed([query])
+          if (vecs[0]) qVecs.push({ vec: vecs[0] })
+        } catch { /* 稠密降级 */ }
       }
-      const fused = new Map() // idx -> score
+      const fused = new Map()
       const rankAdd = (list, weight) => {
         list.forEach((item, r) => {
           fused.set(item.idx, (fused.get(item.idx) ?? 0) + weight / (RRF_K + r + 1))
@@ -156,18 +179,14 @@ function makeAdapter() {
       }
       for (const q of queries) {
         const toks = tokenize(q)
-        if (toks.length) rankAdd(indexed.bm25.topK(toks, CAND), W_BM25)
+        if (toks.length) rankAdd(indexed.bm25.topK(toks, CAND), 1)
       }
-      for (const { q, vec } of qVecs) {
-        const w = q === query ? W_DENSE : W_DENSE * 0.6 // 子查询稠密降权
-        rankAdd(denseTop(vec, CAND), w)
-      }
+      for (const { vec } of qVecs) rankAdd(denseTop(vec, CAND), 1)
 
-      // 2.5) 结构先验：时序题(LLM分类，防 regex 误伤) → session 开场轮加权
-      if (T0_BOOST > 0 && (qtype === 'temporal' || (qtype === 'single' && CHRONO_RE.test(query)))) {
-        for (const [idx, s] of fused) {
-          if (turns[idx].turnIdx === 0) fused.set(idx, s * (1 + T0_BOOST))
-        }
+      // 3) 结构先验
+      const chronoHit = CHRONO_RE.test(query)
+      if (T0_BOOST > 0 && (qtype === 'temporal' || (qtype === 'single' && chronoHit))) {
+        for (const [idx, s] of fused) if (turns[idx].turnIdx === 0) fused.set(idx, s * (1 + T0_BOOST))
       }
 
       let candidates = [...fused.entries()]
@@ -176,7 +195,7 @@ function makeAdapter() {
         .map(([idx]) => idx)
       if (!candidates.length) return { records: [] }
 
-      // 2.6) session 轮转配额（GT 散布多 session 的题型；每 session 最多占 2 席强制跨session覆盖）
+      // 4) 枚举配额
       if (QUOTA_TYPES.has(qtype)) {
         const perSession = new Map()
         const seen = new Set()
@@ -187,51 +206,30 @@ function makeAdapter() {
           seen.add(idx)
           const sid = turns[idx].sessionId
           const used = perSession.get(sid) ?? 0
-          if (used < 2) {
-            head.push(idx)
-            perSession.set(sid, used + 1)
-          } else {
-            tail.push(idx)
-          }
+          if (used < 2) { head.push(idx); perSession.set(sid, used + 1) } else tail.push(idx)
         }
         candidates = [...head, ...tail]
       }
 
-      // 3) 终排路由：枚举/更新题 → LLM 证据选择（+轮转序兜底）；其他题型 → 融合序
-      let finalOrder = candidates
-      const wantSel = LLMSEL && (qtype === 'enumeration' || qtype === 'update')
-      if (wantSel && candidates.length > 1) {
-        const selPool = candidates.slice(0, SEL_POOL)
-        const sel = await llmSelect(query, selPool.map(i => turns[i]))
-        if (sel && sel.length) {
-          const chosen = sel.map(i => candidates[i]).filter(i => i !== undefined)
-          const chosenSet = new Set(chosen)
-          finalOrder = [...chosen, ...candidates.filter(i => !chosenSet.has(i))]
-        }
-      } else if (RERANK && qtype !== 'enumeration' && candidates.length > 1) {
-        const rr = await rerank(query, candidates.map(i => turns[i].content))
-        if (rr && rr.length) {
-          const byIdx = new Map(rr.map(r => [r.index, r.score]))
-          finalOrder = candidates
-            .map((idx, i) => [idx, byIdx.get(i) ?? -1e9])
-            .sort((a, b) => b[1] - a[1])
-            .map(x => x[0])
-        }
-      }
-
-      // 3.5) v8 单变量: 更新题最新值轮置顶（marker 词+值+主题词干重叠≥2，时间序最后命中）
+      // 5) update 置顶
       if (qtype === 'update' && UPDATE_BOOST) {
         const li = findLatestUpdateTurn(query, turns)
-        if (li !== null) {
-          finalOrder = [li, ...finalOrder.filter(i => i !== li)]
+        if (li !== null) candidates = [li, ...candidates.filter(i => i !== li)]
+      }
+
+      // 6) ATA 先答后选（求建议句式跳过）
+      let finalOrder = candidates
+      if (ATA && !PREF_RE.test(query) && candidates.length > 1) {
+        const picks = await ataSelect(query, candidates.slice(0, topK).map(i => turns[i]))
+        if (picks && picks.length) {
+          const head = candidates.slice(0, topK)
+          const chosen = picks.map(i => head[i]).filter(i => i !== undefined)
+          const chosenSet = new Set(chosen)
+          finalOrder = [...chosen, ...head.filter(i => !chosenSet.has(i)), ...candidates.slice(topK)]
         }
       }
 
-      // 4) topK 输出
-      const records = finalOrder.slice(0, topK).map(idx => ({
-        id: turns[idx].id,
-        content: turns[idx].content,
-      }))
+      const records = finalOrder.slice(0, topK).map(idx => ({ id: turns[idx].id, content: turns[idx].content }))
       return { records, scores: records.map(() => 1) }
     },
 
