@@ -36,6 +36,8 @@ const LLMSEL = process.env.MB_LLMSEL === '1'
 const SEL_POOL = Number(process.env.MB_SEL_POOL ?? 50)
 // v8: 更新题最新值置顶（atlas update_detector 规则移植，单变量叠加实验）
 const UPDATE_BOOST = process.env.MB_UPDATE_BOOST !== '0'
+// v9: session 配额适用题型扩展（默认仅枚举；多证据题 temporal/update 的卡位轮 53/61 跨 session）
+const QUOTA_TYPES = new Set((process.env.MB_QUOTA_TYPES ?? 'enumeration').split(',').map(s => s.trim()).filter(Boolean))
 
 async function llmSelect(query, candTurns) {
   const { chat } = await import('../lib/gateway.mjs')
@@ -174,9 +176,8 @@ function makeAdapter() {
         .map(([idx]) => idx)
       if (!candidates.length) return { records: [] }
 
-      // 2.6) 枚举计数题 → session 轮转配额（GT 散布 2-5 session，单查询必聚在 1-2 个；
-      //      每 session 最多占 2 席强制覆盖，实测 19/27 题 GT 恰跨 2-3 session）
-      if (qtype === 'enumeration') {
+      // 2.6) session 轮转配额（GT 散布多 session 的题型；每 session 最多占 2 席强制跨session覆盖）
+      if (QUOTA_TYPES.has(qtype)) {
         const perSession = new Map()
         const seen = new Set()
         const head = []
